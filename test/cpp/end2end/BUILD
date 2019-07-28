@@ -81,6 +81,28 @@ grpc_cc_test(
 )
 
 grpc_cc_test(
+    name = "time_change_test",
+    srcs = ["time_change_test.cc"],
+    data = [
+        ":client_crash_test_server",
+    ],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        ":test_service_impl",
+        "//:gpr",
+        "//:grpc",
+        "//:grpc++",
+        "//src/proto/grpc/testing:echo_messages_proto",
+        "//src/proto/grpc/testing:echo_proto",
+        "//test/core/util:grpc_test_util",
+        "//test/cpp/util:test_util",
+    ],
+    tags = ["no_windows"],
+)
+
+grpc_cc_test(
     name = "client_crash_test",
     srcs = ["client_crash_test.cc"],
     data = [
@@ -110,6 +132,7 @@ grpc_cc_binary(
         "gtest",
     ],
     deps = [
+        ":test_service_impl",
         "//:gpr",
         "//:grpc",
         "//:grpc++",
@@ -117,6 +140,7 @@ grpc_cc_binary(
         "//src/proto/grpc/testing:echo_proto",
         "//src/proto/grpc/testing/duplicate:echo_duplicate_proto",
         "//test/core/util:grpc_test_util",
+        "//test/cpp/util:test_config",
         "//test/cpp/util:test_util",
     ],
 )
@@ -128,6 +152,7 @@ grpc_cc_test(
         "gtest",
     ],
     deps = [
+        ":interceptors_util",
         ":test_service_impl",
         "//:gpr",
         "//:grpc",
@@ -219,8 +244,12 @@ grpc_cc_test(
 
 grpc_cc_test(
     name = "end2end_test",
+    size = "large",
     deps = [
         ":end2end_test_lib",
+        # DO NOT REMOVE THE grpc++ dependence below since the internal build
+        # system uses it to specialize targets
+        "//:grpc++",
     ],
 )
 
@@ -340,7 +369,6 @@ grpc_cc_test(
     name = "mock_test",
     srcs = ["mock_test.cc"],
     external_deps = [
-        "gmock",
         "gtest",
     ],
     deps = [
@@ -388,6 +416,26 @@ grpc_cc_test(
         "//src/proto/grpc/testing:echo_proto",
         "//src/proto/grpc/testing/duplicate:echo_duplicate_proto",
         "//test/core/util:grpc_test_util",
+        "//test/core/util:test_lb_policies",
+        "//test/cpp/util:test_util",
+    ],
+)
+
+grpc_cc_test(
+    name = "service_config_end2end_test",
+    srcs = ["service_config_end2end_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        ":test_service_impl",
+        "//:gpr",
+        "//:grpc",
+        "//:grpc++",
+        "//src/proto/grpc/testing:echo_messages_proto",
+        "//src/proto/grpc/testing:echo_proto",
+        "//src/proto/grpc/testing/duplicate:echo_duplicate_proto",
+        "//test/core/util:grpc_test_util",
         "//test/cpp/util:test_util",
     ],
 )
@@ -396,7 +444,27 @@ grpc_cc_test(
     name = "grpclb_end2end_test",
     srcs = ["grpclb_end2end_test.cc"],
     external_deps = [
-        "gmock",
+        "gtest",
+    ],
+    deps = [
+        ":test_service_impl",
+        "//:gpr",
+        "//:grpc",
+        "//:grpc++",
+        "//:grpc_resolver_fake",
+        "//src/proto/grpc/lb/v1:load_balancer_proto",
+        "//src/proto/grpc/testing:echo_messages_proto",
+        "//src/proto/grpc/testing:echo_proto",
+        "//src/proto/grpc/testing/duplicate:echo_duplicate_proto",
+        "//test/core/util:grpc_test_util",
+        "//test/cpp/util:test_util",
+    ],
+)
+
+grpc_cc_test(
+    name = "xds_end2end_test",
+    srcs = ["xds_end2end_test.cc"],
+    external_deps = [
         "gtest",
     ],
     deps = [
@@ -492,6 +560,7 @@ grpc_cc_binary(
         "//src/proto/grpc/testing:echo_proto",
         "//src/proto/grpc/testing/duplicate:echo_duplicate_proto",
         "//test/core/util:grpc_test_util",
+        "//test/cpp/util:test_config",
         "//test/cpp/util:test_util",
     ],
 )
@@ -520,11 +589,29 @@ grpc_cc_test(
     srcs = ["server_load_reporting_end2end_test.cc"],
     external_deps = [
         "gtest",
-        "gmock",
     ],
     deps = [
         "//:grpcpp_server_load_reporting",
         "//src/proto/grpc/testing:echo_proto",
+        "//test/cpp/util:test_util",
+    ],
+)
+
+grpc_cc_test(
+    name = "flaky_network_test",
+    srcs = ["flaky_network_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    tags = ["manual"],
+    deps = [
+        ":test_service_impl",
+        "//:gpr",
+        "//:grpc",
+        "//:grpc++",
+        "//src/proto/grpc/testing:echo_messages_proto",
+        "//src/proto/grpc/testing:echo_proto",
+        "//test/core/util:grpc_test_util",
         "//test/cpp/util:test_util",
     ],
 )
@@ -563,10 +650,12 @@ grpc_cc_test(
         "//test/core/util:grpc_test_util",
         "//test/cpp/util:test_util",
     ],
+    tags = ["no_windows"],
 )
 
 grpc_cc_test(
     name = "thread_stress_test",
+    timeout = "long",
     srcs = ["thread_stress_test.cc"],
     external_deps = [
         "gtest",
@@ -582,3 +671,61 @@ grpc_cc_test(
         "//test/cpp/util:test_util",
     ],
 )
+
+grpc_cc_test(
+    name = "cfstream_test",
+    srcs = ["cfstream_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    tags = ["manual"],  # test requires root, won't work with bazel RBE
+    deps = [
+        ":test_service_impl",
+        "//:gpr",
+        "//:grpc",
+        "//:grpc++",
+        "//src/proto/grpc/testing:echo_messages_proto",
+        "//src/proto/grpc/testing:echo_proto",
+        "//src/proto/grpc/testing:simple_messages_proto",
+        "//test/core/util:grpc_test_util",
+        "//test/cpp/util:test_util",
+    ],
+)
+
+grpc_cc_test(
+    name = "message_allocator_end2end_test",
+    srcs = ["message_allocator_end2end_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        ":test_service_impl",
+        "//:grpc",
+        "//:gpr",
+        "//:grpc++",
+        "//src/proto/grpc/testing:echo_messages_proto",
+        "//src/proto/grpc/testing:echo_proto",
+        "//src/proto/grpc/testing:simple_messages_proto",
+        "//test/core/util:grpc_test_util",
+        "//test/cpp/util:test_util",
+    ],
+)
+
+grpc_cc_test(
+    name = "port_sharing_end2end_test",
+    srcs = ["port_sharing_end2end_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        ":test_service_impl",
+        "//:gpr",
+        "//:grpc",
+        "//:grpc++",
+        "//src/proto/grpc/testing:echo_messages_proto",
+        "//src/proto/grpc/testing:echo_proto",
+        "//test/core/util:grpc_test_util",
+        "//test/cpp/util:test_util",
+    ],
+)
+

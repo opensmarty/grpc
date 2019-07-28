@@ -35,8 +35,6 @@
 #include "test/core/util/test_config.h"
 #include "test/cpp/end2end/test_service_impl.h"
 
-#include <google/protobuf/text_format.h>
-
 #include <gtest/gtest.h>
 
 using grpc::channelz::v1::GetChannelRequest;
@@ -53,14 +51,6 @@ using grpc::channelz::v1::GetSubchannelRequest;
 using grpc::channelz::v1::GetSubchannelResponse;
 using grpc::channelz::v1::GetTopChannelsRequest;
 using grpc::channelz::v1::GetTopChannelsResponse;
-
-// This code snippet can be used to print out any responses for
-// visual debugging.
-//
-//
-// string out_str;
-// google::protobuf::TextFormat::PrintToString(resp, &out_str);
-// std::cout << "resp: " << out_str << "\n";
 
 namespace grpc {
 namespace testing {
@@ -155,7 +145,7 @@ class ChannelzServerTest : public ::testing::Test {
       ChannelArguments args;
       args.SetInt(GRPC_ARG_ENABLE_CHANNELZ, 1);
       args.SetInt(GRPC_ARG_MAX_CHANNEL_TRACE_EVENT_MEMORY_PER_NODE, 1024);
-      std::shared_ptr<Channel> channel_to_backend = CreateCustomChannel(
+      std::shared_ptr<Channel> channel_to_backend = ::grpc::CreateCustomChannel(
           backend_server_address, InsecureChannelCredentials(), args);
       proxy_service_.AddChannelToBackend(channel_to_backend);
     }
@@ -167,21 +157,20 @@ class ChannelzServerTest : public ::testing::Test {
     // disable channelz. We only want to focus on proxy to backend outbound.
     args.SetInt(GRPC_ARG_ENABLE_CHANNELZ, 0);
     std::shared_ptr<Channel> channel =
-        CreateCustomChannel(target, InsecureChannelCredentials(), args);
+        ::grpc::CreateCustomChannel(target, InsecureChannelCredentials(), args);
     channelz_stub_ = grpc::channelz::v1::Channelz::NewStub(channel);
     echo_stub_ = grpc::testing::EchoTestService::NewStub(channel);
   }
 
   std::unique_ptr<grpc::testing::EchoTestService::Stub> NewEchoStub() {
-    static int salt = 0;
     string target = "dns:localhost:" + to_string(proxy_port_);
     ChannelArguments args;
     // disable channelz. We only want to focus on proxy to backend outbound.
     args.SetInt(GRPC_ARG_ENABLE_CHANNELZ, 0);
     // This ensures that gRPC will not do connection sharing.
-    args.SetInt("salt", salt++);
+    args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, true);
     std::shared_ptr<Channel> channel =
-        CreateCustomChannel(target, InsecureChannelCredentials(), args);
+        ::grpc::CreateCustomChannel(target, InsecureChannelCredentials(), args);
     return grpc::testing::EchoTestService::NewStub(channel);
   }
 
@@ -708,7 +697,7 @@ TEST_F(ChannelzServerTest, GetServerSocketsPaginationTest) {
                                          get_server_sockets_request,
                                          &get_server_sockets_response);
     EXPECT_TRUE(s.ok()) << "s.error_message() = " << s.error_message();
-    // We add one to account the the channelz stub that will end up creating
+    // We add one to account the channelz stub that will end up creating
     // a serversocket.
     EXPECT_EQ(get_server_sockets_response.socket_ref_size(),
               kNumServerSocketsCreated + 1);

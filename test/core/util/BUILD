@@ -76,16 +76,16 @@ grpc_cc_library(
         "tracer_util.h",
         "trickle_endpoint.h",
     ],
+    data = [
+        "lsan_suppressions.txt",
+        "tsan_suppressions.txt",
+        "ubsan_suppressions.txt",
+    ],
     language = "C++",
     deps = [
         ":grpc_debugger_macros",
         "//:gpr",
         "//:grpc_common",
-    ],
-    data = [
-        "lsan_suppressions.txt",
-        "tsan_suppressions.txt",
-        "ubsan_suppressions.txt",
     ],
 )
 
@@ -132,7 +132,9 @@ grpc_cc_library(
     deps = [
         ":grpc_test_util",
         "//:grpc",
+        "//test/cpp/util:test_config",
     ],
+    tags = ["no_windows"],
 )
 
 grpc_cc_test(
@@ -153,4 +155,14 @@ sh_library(
 sh_library(
     name = "run_with_poller_sh",
     srcs = ["run_with_poller.sh"],
+)
+
+grpc_cc_library(
+    name = "test_lb_policies",
+    testonly = 1,
+    srcs = ["test_lb_policies.cc"],
+    hdrs = ["test_lb_policies.h"],
+    deps = [
+        "//:grpc",
+    ],
 )

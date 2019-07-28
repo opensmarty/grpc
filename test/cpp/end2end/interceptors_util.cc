@@ -48,7 +48,7 @@ void MakeClientStreamingCall(const std::shared_ptr<Channel>& channel) {
   EchoResponse resp;
   string expected_resp = "";
   auto writer = stub->RequestStream(&ctx, &resp);
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < kNumStreamingMessages; i++) {
     writer->Write(req);
     expected_resp += "Hello";
   }
@@ -73,7 +73,7 @@ void MakeServerStreamingCall(const std::shared_ptr<Channel>& channel) {
     EXPECT_EQ(resp.message(), "Hello");
     count++;
   }
-  ASSERT_EQ(count, 10);
+  ASSERT_EQ(count, kNumStreamingMessages);
   Status s = reader->Finish();
   EXPECT_EQ(s.ok(), true);
 }
@@ -85,7 +85,7 @@ void MakeBidiStreamingCall(const std::shared_ptr<Channel>& channel) {
   EchoResponse resp;
   ctx.AddMetadata("testkey", "testvalue");
   auto stream = stub->BidiStream(&ctx);
-  for (auto i = 0; i < 10; i++) {
+  for (auto i = 0; i < kNumStreamingMessages; i++) {
     req.set_message("Hello" + std::to_string(i));
     stream->Write(req);
     stream->Read(&resp);
@@ -126,6 +126,16 @@ bool CheckMetadata(const std::multimap<grpc::string_ref, grpc::string_ref>& map,
                    const string& key, const string& value) {
   for (const auto& pair : map) {
     if (pair.first.starts_with(key) && pair.second.starts_with(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CheckMetadata(const std::multimap<grpc::string, grpc::string>& map,
+                   const string& key, const string& value) {
+  for (const auto& pair : map) {
+    if (pair.first == key && pair.second == value) {
       return true;
     }
   }

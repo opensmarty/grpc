@@ -31,6 +31,7 @@
 #include <utility>
 
 #include "src/core/lib/channel/channel_args.h"
+#include "src/core/lib/channel/channelz.h"
 #include "src/core/lib/channel/connected_channel.h"
 #include "src/core/lib/debug/stats.h"
 #include "src/core/lib/gpr/mpscq.h"
@@ -111,7 +112,7 @@ struct channel_data {
   uint32_t registered_method_max_probes;
   grpc_closure finish_destroy_channel_closure;
   grpc_closure channel_connectivity_changed;
-  grpc_core::RefCountedPtr<grpc_core::channelz::SocketNode> socket_node;
+  intptr_t channelz_socket_uuid;
 };
 
 typedef struct shutdown_tag {
@@ -123,7 +124,7 @@ typedef struct shutdown_tag {
 typedef enum {
   /* waiting for metadata */
   NOT_STARTED,
-  /* inital metadata read, not flow controlled in yet */
+  /* initial metadata read, not flow controlled in yet */
   PENDING,
   /* flow controlled in, on completion queue */
   ACTIVATED,
@@ -190,7 +191,7 @@ struct call_data {
   grpc_closure publish;
 
   call_data* pending_next = nullptr;
-  grpc_call_combiner* call_combiner;
+  grpc_core::CallCombiner* call_combiner;
 };
 
 struct request_matcher {
@@ -347,8 +348,8 @@ static void channel_broadcaster_shutdown(channel_broadcaster* cb,
  */
 
 static void request_matcher_init(request_matcher* rm, grpc_server* server) {
-  memset(rm, 0, sizeof(*rm));
   rm->server = server;
+  rm->pending_head = rm->pending_tail = nullptr;
   rm->requests_per_cq = static_cast<gpr_locked_mpscq*>(
       gpr_malloc(sizeof(*rm->requests_per_cq) * server->cq_count));
   for (size_t i = 0; i < server->cq_count; i++) {
@@ -464,7 +465,8 @@ static void destroy_channel(channel_data* chand, grpc_error* error) {
   GRPC_CLOSURE_INIT(&chand->finish_destroy_channel_closure,
                     finish_destroy_channel, chand, grpc_schedule_on_exec_ctx);
 
-  if (grpc_server_channel_trace.enabled() && error != GRPC_ERROR_NONE) {
+  if (GRPC_TRACE_FLAG_ENABLED(grpc_server_channel_trace) &&
+      error != GRPC_ERROR_NONE) {
     const char* msg = grpc_error_string(error);
     gpr_log(GPR_INFO, "Disconnected client: %s", msg);
   }
@@ -512,7 +514,7 @@ static void publish_call(grpc_server* server, call_data* calld, size_t cq_idx,
   }
 
   grpc_cq_end_op(calld->cq_new, rc->tag, GRPC_ERROR_NONE, done_request_event,
-                 rc, &rc->completion);
+                 rc, &rc->completion, true);
 }
 
 static void publish_new_rpc(void* arg, grpc_error* error) {
@@ -601,8 +603,9 @@ static void finish_start_new_rpc(
       break;
     case GRPC_SRM_PAYLOAD_READ_INITIAL_BYTE_BUFFER: {
       grpc_op op;
-      memset(&op, 0, sizeof(op));
       op.op = GRPC_OP_RECV_MESSAGE;
+      op.flags = 0;
+      op.reserved = nullptr;
       op.data.recv_message.recv_message = &calld->payload;
       GRPC_CLOSURE_INIT(&calld->publish, publish_new_rpc, elem,
                         grpc_schedule_on_exec_ctx);
@@ -623,8 +626,8 @@ static void start_new_rpc(grpc_call_element* elem) {
   if (chand->registered_methods && calld->path_set && calld->host_set) {
     /* TODO(ctiller): unify these two searches */
     /* check for an exact match with host */
-    hash = GRPC_MDSTR_KV_HASH(grpc_slice_hash(calld->host),
-                              grpc_slice_hash(calld->path));
+    hash = GRPC_MDSTR_KV_HASH(grpc_slice_hash_internal(calld->host),
+                              grpc_slice_hash_internal(calld->path));
     for (i = 0; i <= chand->registered_method_max_probes; i++) {
       rm = &chand->registered_methods[(hash + i) %
                                       chand->registered_method_slots];
@@ -642,7 +645,7 @@ static void start_new_rpc(grpc_call_element* elem) {
       return;
     }
     /* check for a wildcard method definition (no host set) */
-    hash = GRPC_MDSTR_KV_HASH(0, grpc_slice_hash(calld->path));
+    hash = GRPC_MDSTR_KV_HASH(0, grpc_slice_hash_internal(calld->path));
     for (i = 0; i <= chand->registered_method_max_probes; i++) {
       rm = &chand->registered_methods[(hash + i) %
                                       chand->registered_method_slots];
@@ -708,8 +711,10 @@ static void maybe_finish_shutdown(grpc_server* server) {
     return;
   }
 
+  gpr_mu_lock(&server->mu_call);
   kill_pending_work_locked(
       server, GRPC_ERROR_CREATE_FROM_STATIC_STRING("Server Shutdown"));
+  gpr_mu_unlock(&server->mu_call);
 
   if (server->root_channel_data.next != &server->root_channel_data ||
       server->listeners_destroyed < num_listeners(server)) {
@@ -939,7 +944,6 @@ static grpc_error* init_channel_elem(grpc_channel_element* elem,
 static void destroy_channel_elem(grpc_channel_element* elem) {
   size_t i;
   channel_data* chand = static_cast<channel_data*>(elem->channel_data);
-  chand->socket_node.reset();
   if (chand->registered_methods) {
     for (i = 0; i < chand->registered_method_slots; i++) {
       grpc_slice_unref_internal(chand->registered_methods[i].method);
@@ -950,6 +954,11 @@ static void destroy_channel_elem(grpc_channel_element* elem) {
     gpr_free(chand->registered_methods);
   }
   if (chand->server) {
+    if (chand->server->channelz_server != nullptr &&
+        chand->channelz_socket_uuid != 0) {
+      chand->server->channelz_server->RemoveChildSocket(
+          chand->channelz_socket_uuid);
+    }
     gpr_mu_lock(&chand->server->mu_global);
     chand->next->prev = chand->prev;
     chand->prev->next = chand->next;
@@ -997,10 +1006,12 @@ void grpc_server_register_completion_queue(grpc_server* server,
       "grpc_server_register_completion_queue(server=%p, cq=%p, reserved=%p)", 3,
       (server, cq, reserved));
 
-  if (grpc_get_cq_completion_type(cq) != GRPC_CQ_NEXT) {
+  auto cq_type = grpc_get_cq_completion_type(cq);
+  if (cq_type != GRPC_CQ_NEXT && cq_type != GRPC_CQ_CALLBACK) {
     gpr_log(GPR_INFO,
-            "Completion queue which is not of type GRPC_CQ_NEXT is being "
-            "registered as a server-completion-queue");
+            "Completion queue of type %d is being registered as a "
+            "server-completion-queue",
+            static_cast<int>(cq_type));
     /* Ideally we should log an error and abort but ruby-wrapped-language API
        calls grpc_completion_queue_pluck() on server completion queues */
   }
@@ -1096,20 +1107,6 @@ void* grpc_server_register_method(
   return m;
 }
 
-static void start_listeners(void* s, grpc_error* error) {
-  grpc_server* server = static_cast<grpc_server*>(s);
-  for (listener* l = server->listeners; l; l = l->next) {
-    l->start(server, l->arg, server->pollsets, server->pollset_count);
-  }
-
-  gpr_mu_lock(&server->mu_global);
-  server->starting = false;
-  gpr_cv_signal(&server->starting_cv);
-  gpr_mu_unlock(&server->mu_global);
-
-  server_unref(server);
-}
-
 void grpc_server_start(grpc_server* server) {
   size_t i;
   grpc_core::ExecCtx exec_ctx;
@@ -1131,12 +1128,18 @@ void grpc_server_start(grpc_server* server) {
     request_matcher_init(&rm->matcher, server);
   }
 
-  server_ref(server);
+  gpr_mu_lock(&server->mu_global);
   server->starting = true;
-  GRPC_CLOSURE_SCHED(
-      GRPC_CLOSURE_CREATE(start_listeners, server,
-                          grpc_executor_scheduler(GRPC_EXECUTOR_SHORT)),
-      GRPC_ERROR_NONE);
+  gpr_mu_unlock(&server->mu_global);
+
+  for (listener* l = server->listeners; l; l = l->next) {
+    l->start(server, l->arg, server->pollsets, server->pollset_count);
+  }
+
+  gpr_mu_lock(&server->mu_global);
+  server->starting = false;
+  gpr_cv_signal(&server->starting_cv);
+  gpr_mu_unlock(&server->mu_global);
 }
 
 void grpc_server_get_pollsets(grpc_server* server, grpc_pollset*** pollsets,
@@ -1148,7 +1151,8 @@ void grpc_server_get_pollsets(grpc_server* server, grpc_pollset*** pollsets,
 void grpc_server_setup_transport(
     grpc_server* s, grpc_transport* transport, grpc_pollset* accepting_pollset,
     const grpc_channel_args* args,
-    grpc_core::RefCountedPtr<grpc_core::channelz::SocketNode> socket_node,
+    const grpc_core::RefCountedPtr<grpc_core::channelz::SocketNode>&
+        socket_node,
     grpc_resource_user* resource_user) {
   size_t num_registered_methods;
   size_t alloc;
@@ -1170,7 +1174,12 @@ void grpc_server_setup_transport(
   chand->server = s;
   server_ref(s);
   chand->channel = channel;
-  chand->socket_node = std::move(socket_node);
+  if (socket_node != nullptr) {
+    chand->channelz_socket_uuid = socket_node->uuid();
+    s->channelz_server->AddChildSocket(socket_node);
+  } else {
+    chand->channelz_socket_uuid = 0;
+  }
 
   size_t cq_idx;
   for (cq_idx = 0; cq_idx < s->cq_count; cq_idx++) {
@@ -1198,14 +1207,14 @@ void grpc_server_setup_transport(
       bool has_host;
       grpc_slice method;
       if (rm->host != nullptr) {
-        host = grpc_slice_intern(grpc_slice_from_static_string(rm->host));
+        host = grpc_slice_from_static_string(rm->host);
         has_host = true;
       } else {
         has_host = false;
       }
-      method = grpc_slice_intern(grpc_slice_from_static_string(rm->method));
-      hash = GRPC_MDSTR_KV_HASH(has_host ? grpc_slice_hash(host) : 0,
-                                grpc_slice_hash(method));
+      method = grpc_slice_from_static_string(rm->method);
+      hash = GRPC_MDSTR_KV_HASH(has_host ? grpc_slice_hash_internal(host) : 0,
+                                grpc_slice_hash_internal(method));
       for (probes = 0; chand->registered_methods[(hash + probes) % slots]
                            .server_registered_method != nullptr;
            probes++)
@@ -1245,28 +1254,6 @@ void grpc_server_setup_transport(
   grpc_transport_perform_op(transport, op);
 }
 
-void grpc_server_populate_server_sockets(
-    grpc_server* s, grpc_core::channelz::ChildSocketsList* server_sockets,
-    intptr_t start_idx) {
-  gpr_mu_lock(&s->mu_global);
-  channel_data* c = nullptr;
-  for (c = s->root_channel_data.next; c != &s->root_channel_data; c = c->next) {
-    if (c->socket_node != nullptr && c->socket_node->uuid() >= start_idx) {
-      server_sockets->push_back(c->socket_node.get());
-    }
-  }
-  gpr_mu_unlock(&s->mu_global);
-}
-
-void grpc_server_populate_listen_sockets(
-    grpc_server* server, grpc_core::channelz::ChildRefsList* listen_sockets) {
-  gpr_mu_lock(&server->mu_global);
-  for (listener* l = server->listeners; l != nullptr; l = l->next) {
-    listen_sockets->push_back(l->socket_uuid);
-  }
-  gpr_mu_unlock(&server->mu_global);
-}
-
 void done_published_shutdown(void* done_arg, grpc_cq_completion* storage) {
   (void)done_arg;
   gpr_free(storage);
@@ -1301,6 +1288,7 @@ void grpc_server_shutdown_and_notify(grpc_server* server,
   listener* l;
   shutdown_tag* sdt;
   channel_broadcaster broadcaster;
+  grpc_core::ApplicationCallbackExecCtx callback_exec_ctx;
   grpc_core::ExecCtx exec_ctx;
 
   GRPC_API_TRACE("grpc_server_shutdown_and_notify(server=%p, cq=%p, tag=%p)", 3,
@@ -1353,6 +1341,9 @@ void grpc_server_shutdown_and_notify(grpc_server* server,
     GRPC_CLOSURE_INIT(&l->destroy_done, listener_destroy_done, server,
                       grpc_schedule_on_exec_ctx);
     l->destroy(server, l->arg, &l->destroy_done);
+    if (server->channelz_server != nullptr && l->socket_uuid != 0) {
+      server->channelz_server->RemoveChildListenSocket(l->socket_uuid);
+    }
   }
 
   channel_broadcaster_shutdown(&broadcaster, true /* send_goaway */,
@@ -1368,6 +1359,7 @@ void grpc_server_shutdown_and_notify(grpc_server* server,
 
 void grpc_server_cancel_all_calls(grpc_server* server) {
   channel_broadcaster broadcaster;
+  grpc_core::ApplicationCallbackExecCtx callback_exec_ctx;
   grpc_core::ExecCtx exec_ctx;
 
   GRPC_API_TRACE("grpc_server_cancel_all_calls(server=%p)", 1, (server));
@@ -1383,6 +1375,7 @@ void grpc_server_cancel_all_calls(grpc_server* server) {
 
 void grpc_server_destroy(grpc_server* server) {
   listener* l;
+  grpc_core::ApplicationCallbackExecCtx callback_exec_ctx;
   grpc_core::ExecCtx exec_ctx;
 
   GRPC_API_TRACE("grpc_server_destroy(server=%p)", 1, (server));
@@ -1414,6 +1407,9 @@ void grpc_server_add_listener(grpc_server* server, void* arg,
   l->start = start;
   l->destroy = destroy;
   l->socket_uuid = socket_uuid;
+  if (server->channelz_server != nullptr && socket_uuid != 0) {
+    server->channelz_server->AddChildListenSocket(socket_uuid);
+  }
   l->next = server->listeners;
   server->listeners = l;
 }
@@ -1468,6 +1464,7 @@ grpc_call_error grpc_server_request_call(
     grpc_completion_queue* cq_bound_to_call,
     grpc_completion_queue* cq_for_notification, void* tag) {
   grpc_call_error error;
+  grpc_core::ApplicationCallbackExecCtx callback_exec_ctx;
   grpc_core::ExecCtx exec_ctx;
   requested_call* rc = static_cast<requested_call*>(gpr_malloc(sizeof(*rc)));
   GRPC_STATS_INC_SERVER_REQUESTED_CALLS();
@@ -1514,11 +1511,11 @@ grpc_call_error grpc_server_request_registered_call(
     grpc_metadata_array* initial_metadata, grpc_byte_buffer** optional_payload,
     grpc_completion_queue* cq_bound_to_call,
     grpc_completion_queue* cq_for_notification, void* tag) {
-  grpc_call_error error;
+  grpc_core::ApplicationCallbackExecCtx callback_exec_ctx;
   grpc_core::ExecCtx exec_ctx;
+  GRPC_STATS_INC_SERVER_REQUESTED_CALLS();
   requested_call* rc = static_cast<requested_call*>(gpr_malloc(sizeof(*rc)));
   registered_method* rm = static_cast<registered_method*>(rmp);
-  GRPC_STATS_INC_SERVER_REQUESTED_CALLS();
   GRPC_API_TRACE(
       "grpc_server_request_registered_call("
       "server=%p, rmp=%p, call=%p, deadline=%p, initial_metadata=%p, "
@@ -1536,19 +1533,17 @@ grpc_call_error grpc_server_request_registered_call(
   }
   if (cq_idx == server->cq_count) {
     gpr_free(rc);
-    error = GRPC_CALL_ERROR_NOT_SERVER_COMPLETION_QUEUE;
-    goto done;
+    return GRPC_CALL_ERROR_NOT_SERVER_COMPLETION_QUEUE;
   }
   if ((optional_payload == nullptr) !=
       (rm->payload_handling == GRPC_SRM_PAYLOAD_NONE)) {
     gpr_free(rc);
-    error = GRPC_CALL_ERROR_PAYLOAD_TYPE_MISMATCH;
-    goto done;
+    return GRPC_CALL_ERROR_PAYLOAD_TYPE_MISMATCH;
   }
+
   if (grpc_cq_begin_op(cq_for_notification, tag) == false) {
     gpr_free(rc);
-    error = GRPC_CALL_ERROR_COMPLETION_QUEUE_SHUTDOWN;
-    goto done;
+    return GRPC_CALL_ERROR_COMPLETION_QUEUE_SHUTDOWN;
   }
   rc->cq_idx = cq_idx;
   rc->type = REGISTERED_CALL;
@@ -1560,10 +1555,7 @@ grpc_call_error grpc_server_request_registered_call(
   rc->data.registered.deadline = deadline;
   rc->initial_metadata = initial_metadata;
   rc->data.registered.optional_payload = optional_payload;
-  error = queue_call_request(server, cq_idx, rc);
-done:
-
-  return error;
+  return queue_call_request(server, cq_idx, rc);
 }
 
 static void fail_call(grpc_server* server, size_t cq_idx, requested_call* rc,

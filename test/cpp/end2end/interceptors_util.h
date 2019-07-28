@@ -152,6 +152,8 @@ class EchoTestServiceStreamingImpl : public EchoTestService::Service {
   }
 };
 
+constexpr int kNumStreamingMessages = 10;
+
 void MakeCall(const std::shared_ptr<Channel>& channel);
 
 void MakeClientStreamingCall(const std::shared_ptr<Channel>& channel);
@@ -163,6 +165,9 @@ void MakeBidiStreamingCall(const std::shared_ptr<Channel>& channel);
 void MakeCallbackCall(const std::shared_ptr<Channel>& channel);
 
 bool CheckMetadata(const std::multimap<grpc::string_ref, grpc::string_ref>& map,
+                   const string& key, const string& value);
+
+bool CheckMetadata(const std::multimap<grpc::string, grpc::string>& map,
                    const string& key, const string& value);
 
 std::vector<std::unique_ptr<experimental::ClientInterceptorFactoryInterface>>
